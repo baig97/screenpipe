@@ -194,6 +194,30 @@ next to the released app without taking over its identity or updater settings.
    cargo build --release
    ```
 
+   on ubuntu 22.04 (`glibc 2.35`), `cargo build` may fail while compiling `ort-sys` with errors such as `__isoc23_strtol` or `could not link to the ONNX Runtime build`. this happens when `ort-sys` attempts to use static prebuilts compiled for newer `glibc` versions.
+
+   download Microsoft's ONNX Runtime binary and use dynamic linking instead:
+
+   ```bash
+   wget https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz
+   tar -xvf onnxruntime-linux-x64-1.19.2.tgz
+
+   export ORT_LIB_LOCATION="$(pwd)/onnxruntime-linux-x64-1.19.2/lib"
+   export ORT_PREFER_DYNAMIC_LINK=1
+   export LD_LIBRARY_PATH="$ORT_LIB_LOCATION:$LD_LIBRARY_PATH"
+
+   cargo build --release
+   ```
+
+   to persist the runtime library path across terminal sessions:
+
+   ```bash
+   echo 'export LD_LIBRARY_PATH="$HOME/screenpipe/onnxruntime-linux-x64-1.19.2/lib:$LD_LIBRARY_PATH"' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+   adjust the path if ONNX Runtime was extracted somewhere else.
+
 5. **run the application**:
    ```bash
    ./target/release/screenpipe
