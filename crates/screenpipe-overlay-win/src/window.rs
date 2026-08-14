@@ -43,12 +43,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, KillTimer, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WINDOWPOS, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, MSG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WINDOWPOS, WM_APP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::actions::{action_for, anchor_action};
@@ -218,6 +219,11 @@ struct Ctx {
     /// because it must not expand the pill — it only suspends the toast's
     /// self-dismiss and freezes the expansion the pointer arrived with.
     toast_hovered: bool,
+    /// The last anchor the app pushed, so a re-push of the same value can be
+    /// told apart from the app actually asking the pill to move.
+    pushed_anchor: Option<Anchor>,
+    /// Same, for the transcript card's pin.
+    pushed_pinned: Option<bool>,
     dragging: bool,
     drag_offset: (i32, i32),
     animating: bool,
@@ -245,6 +251,12 @@ fn run_message_loop(
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
+            // A class with no cursor does not set one when the pointer enters,
+            // so the window inherits whatever the last window asked for. From a
+            // GUI process that is usually the app-starting cursor: hovering the
+            // pill showed a spinner, as if it were busy. Name the cursor and it
+            // is a plain arrow like every other control.
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: class,
             ..Default::default()
         };
@@ -284,6 +296,8 @@ fn run_message_loop(
             press_origin: None,
             press_can_drag: false,
             toast_hovered: false,
+            pushed_anchor: None,
+            pushed_pinned: None,
             dragging: false,
             drag_offset: (0, 0),
             animating: false,
@@ -634,6 +648,43 @@ fn mouse_dip(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     (x / scale, y / scale)
 }
 
+/// Where the pill should sit after a state push, and the anchor to remember as
+/// the app's latest word on the subject.
+///
+/// Where the pill sits is the user's, decided by dragging it. But the app
+/// re-pushes its whole state constantly — the audio meter alone arrives many
+/// times a second — and its copy still holds the pre-drag anchor until it has
+/// persisted the new one and read it back. Taking the pushed value at face
+/// value therefore snapped the pill home within a frame of the drop, which is
+/// what a drag that "goes back" is. So an echo of the anchor the app already
+/// sent leaves the pill where the user put it, and only a *changed* anchor
+/// moves it: settings, a restore, another window.
+fn resolve_anchor(
+    pushed: Option<Anchor>,
+    incoming: Anchor,
+    window: Anchor,
+    dragging: bool,
+) -> (Anchor, Option<Anchor>) {
+    let (applied, pushed) = resolve_owned(pushed, incoming, window);
+    // Nothing relocates the pill while it is under the pointer, not even a
+    // genuine change: the drop decides where it lands.
+    (if dragging { window } else { applied }, pushed)
+}
+
+/// The value to apply for something the *window* owns but the app also sends
+/// back in every state push.
+///
+/// The app's copy is only as fresh as the last round-trip through its store, so
+/// a value the user just changed here — where the pill sits, whether the card
+/// is pinned — arrives back stale a few milliseconds later and would undo
+/// itself. An echo of what the app last sent is therefore ignored in favour of
+/// what the window has; only a value the app actually *changed* wins.
+fn resolve_owned<T: PartialEq + Copy>(pushed: Option<T>, incoming: T, window: T) -> (T, Option<T>) {
+    let app_changed_it = pushed != Some(incoming);
+    let applied = if app_changed_it { incoming } else { window };
+    (applied, Some(incoming))
+}
+
 /// Drain the command channel. Returns whether anything changed.
 fn drain_commands(hwnd: HWND) -> (bool, bool) {
     let Some(ctx) = (unsafe { ctx_of(hwnd) }) else {
@@ -655,9 +706,21 @@ fn drain_commands(hwnd: HWND) -> (bool, bool) {
                 s.pressed_control = ctx.state.pressed_control;
                 s.dragging = ctx.state.dragging;
                 s.drag_target = ctx.state.drag_target;
-                if ctx.dragging {
-                    s.anchor = ctx.state.anchor;
-                }
+                let (anchor, pushed) =
+                    resolve_anchor(ctx.pushed_anchor, s.anchor, ctx.state.anchor, ctx.dragging);
+                s.anchor = anchor;
+                ctx.pushed_anchor = pushed;
+                // The pin is the same story as the anchor: the pill toggles it
+                // itself and never reports it, so the app's copy is always the
+                // one from before the click. Taking it at face value unpinned
+                // the card again within a frame.
+                let (pinned, pushed) = resolve_owned(
+                    ctx.pushed_pinned,
+                    s.transcript_pinned,
+                    ctx.state.transcript_pinned,
+                );
+                s.transcript_pinned = pinned;
+                ctx.pushed_pinned = pushed;
                 // The caller does not own the notification either — it arrives
                 // through show_notification and leaves on its own schedule.
                 s.notification = ctx.state.notification.clone();
@@ -981,5 +1044,77 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replays the drag that would not stick: the app's own copy of the state
+    /// is stale the moment the pointer is released, and it re-pushes that copy
+    /// continuously.
+    #[test]
+    fn a_dragged_pill_survives_the_apps_stale_state_pushes() {
+        // Startup: the app pushes the persisted anchor and the pill takes it.
+        let (anchor, pushed) =
+            resolve_anchor(None, Anchor::BottomRight, Anchor::BottomCenter, false);
+        assert_eq!(anchor, Anchor::BottomRight, "first push places the pill");
+
+        // The user drags it across the screen; the window now owns MiddleLeft.
+        let dragged = Anchor::MiddleLeft;
+
+        // The metrics feed pushes again, still carrying the pre-drag anchor.
+        let (anchor, pushed) = resolve_anchor(pushed, Anchor::BottomRight, dragged, false);
+        assert_eq!(anchor, dragged, "an echo must not drag the pill home");
+
+        // ...and keeps pushing, many times a second.
+        let (anchor, pushed) = resolve_anchor(pushed, Anchor::BottomRight, dragged, false);
+        assert_eq!(anchor, dragged);
+
+        // Settings genuinely move it: a *changed* anchor is obeyed.
+        let (anchor, pushed) = resolve_anchor(pushed, Anchor::TopLeft, dragged, false);
+        assert_eq!(anchor, Anchor::TopLeft);
+
+        // And once the app has caught up, echoing the dragged value is a no-op.
+        let (anchor, _) = resolve_anchor(pushed, Anchor::TopLeft, Anchor::TopLeft, false);
+        assert_eq!(anchor, Anchor::TopLeft);
+    }
+
+    /// The pin lives only in the window — clicking it reports nothing to the
+    /// app — so the app's copy is always the value from before the click, and
+    /// it re-sends that copy many times a second. Taking it at face value
+    /// unpinned the card again within a frame of pinning it.
+    #[test]
+    fn pinning_the_card_survives_the_apps_stale_state_pushes() {
+        // Startup: nothing pinned, app and window agree.
+        let (pinned, pushed) = resolve_owned(None, false, false);
+        assert!(!pinned);
+
+        // The user clicks the pin. The window owns `true` now; the app still
+        // believes `false` and keeps saying so.
+        let (pinned, pushed) = resolve_owned(pushed, false, true);
+        assert!(pinned, "an echo of the pre-click value must not unpin it");
+        let (pinned, pushed) = resolve_owned(pushed, false, true);
+        assert!(pinned, "and it must not unpin on the next push either");
+
+        // The meeting ends: the app genuinely clears the pin, and that wins.
+        let (pinned, pushed) = resolve_owned(pushed, true, true);
+        assert!(pinned, "app catching up to true is a no-op");
+        let (pinned, _) = resolve_owned(pushed, false, true);
+        assert!(!pinned, "a real change from the app clears the pin");
+    }
+
+    /// A push landing mid-drag must never teleport the pill out from under the
+    /// pointer, even when the app really did change the anchor.
+    #[test]
+    fn nothing_moves_the_pill_while_it_is_being_dragged() {
+        let (anchor, _) = resolve_anchor(
+            Some(Anchor::BottomRight),
+            Anchor::TopLeft,
+            Anchor::MiddleRight,
+            true,
+        );
+        assert_eq!(anchor, Anchor::MiddleRight);
     }
 }
